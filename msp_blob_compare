@@ -1,0 +1,287 @@
+"""
+MSP / Azure Blob File Comparison
+
+Reads:
+1) Azure/AzCopy blob listing file
+2) CRM/MSP filepath listing file
+
+Compares by filename (case-insensitive) and generates:
+- movetoblob.bat
+- missing_from_azure.csv
+
+Designed for Jupyter Notebook / Anaconda on Windows.
+No third-party packages required.
+"""
+
+from pathlib import Path
+import csv
+import re
+
+# ============================================================
+# CONFIGURATION - CHANGE ONLY THESE VALUES
+# ============================================================
+
+AZURE_LIST_FILE = r"C:\ShawnDefect\azure_20261105_before.csv"
+CRM_FILEPATH_LIST = r"C:\ShawnDefect\crm_filepaths.txt"
+
+DESTINATION_FOLDER = r"C:\ToMoveToBLOB"
+OUTPUT_BAT_FILE = r"C:\ShawnDefect\movetoblob_20261105.bat"
+OUTPUT_REPORT_FILE = r"C:\ShawnDefect\missing_from_azure_20261105.csv"
+
+CASE_INSENSITIVE = True
+
+
+def normalize_filename(name):
+    name = name.strip().strip('"').strip("'")
+    return name.lower() if CASE_INSENSITIVE else name
+
+
+def extract_basename_from_any_path(value):
+    value = value.strip().strip('"').strip("'")
+    value = value.replace("/", "\\")
+    return value.rsplit("\\", 1)[-1].strip()
+
+
+def parse_azure_line(line):
+    line = line.strip()
+    if not line:
+        return None
+
+    line = re.sub(r"^\s*INFO:\s*", "", line, flags=re.IGNORECASE)
+    first_part = line.split(";", 1)[0].strip()
+    first_part = first_part.strip('"').strip("'").strip()
+
+    if not first_part:
+        return None
+
+    filename = extract_basename_from_any_path(first_part)
+
+    bad_values = {
+        "name", "filename", "file", "path", "blob", "blob name"
+    }
+
+    if filename.lower() in bad_values:
+        return None
+
+    return filename
+
+
+def read_azure_files(file_path):
+    azure_files = set()
+
+    with open(file_path, "r", encoding="utf-8-sig", errors="ignore") as f:
+        for line in f:
+            filename = parse_azure_line(line)
+            if filename:
+                azure_files.add(normalize_filename(filename))
+
+    return azure_files
+
+
+def looks_like_file_path(value):
+    value = value.strip().strip('"').strip("'")
+
+    if not value:
+        return False
+
+    if value.lower() in {
+        "path", "filepath", "file path", "filename",
+        "file", "sourcepath", "source path"
+    }:
+        return False
+
+    basename = extract_basename_from_any_path(value)
+    return "." in basename and not basename.endswith(".")
+
+
+def parse_crm_filepaths(file_path):
+    crm_files = {}
+    duplicates = {}
+
+    with open(
+        file_path,
+        "r",
+        encoding="utf-8-sig",
+        errors="ignore",
+        newline=""
+    ) as f:
+
+        for raw_line in f:
+            raw_line = raw_line.strip()
+            if not raw_line:
+                continue
+
+            try:
+                cells = next(csv.reader([raw_line]))
+            except Exception:
+                cells = [raw_line]
+
+            candidate = None
+
+            # Prefer full Windows / UNC paths.
+            for cell in cells:
+                cleaned = cell.strip().strip('"').strip("'")
+
+                if "\\" in cleaned or re.match(r"^[A-Za-z]:\\", cleaned):
+                    if looks_like_file_path(cleaned):
+                        candidate = cleaned
+                        break
+
+            # Fall back to first filename-like cell.
+            if candidate is None:
+                for cell in cells:
+                    cleaned = cell.strip().strip('"').strip("'")
+
+                    if looks_like_file_path(cleaned):
+                        candidate = cleaned
+                        break
+
+            if candidate is None:
+                continue
+
+            filename = extract_basename_from_any_path(candidate)
+            key = normalize_filename(filename)
+
+            if key in crm_files and crm_files[key] != candidate:
+                duplicates.setdefault(key, [crm_files[key]])
+
+                if candidate not in duplicates[key]:
+                    duplicates[key].append(candidate)
+            else:
+                crm_files[key] = candidate
+
+    return crm_files, duplicates
+
+
+def compare_files(azure_files, crm_files):
+    missing = []
+
+    for normalized_name, source_path in crm_files.items():
+        if normalized_name not in azure_files:
+            actual_filename = extract_basename_from_any_path(source_path)
+            missing.append((actual_filename, source_path))
+
+    missing.sort(key=lambda x: x[0].lower())
+    return missing
+
+
+def write_bat(missing_files, destination_folder, output_bat_file):
+    output_path = Path(output_bat_file)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    destination = destination_folder.rstrip("\\/")
+
+    with open(output_path, "w", encoding="utf-8") as bat:
+        bat.write("@echo off\n")
+        bat.write("setlocal\n")
+        bat.write("echo ================================================\n")
+        bat.write("echo MSP files missing from Azure Blob\n")
+        bat.write("echo ================================================\n")
+        bat.write(f'if not exist "{destination}" mkdir "{destination}"\n')
+        bat.write("\n")
+
+        for filename, source_path in missing_files:
+            bat.write(
+                f'copy /Y "{source_path}" "{destination}\\{filename}"\n'
+            )
+
+        bat.write("\n")
+        bat.write("echo ================================================\n")
+        bat.write(
+            f"echo Completed. {len(missing_files)} file(s) processed.\n"
+        )
+        bat.write("echo ================================================\n")
+        bat.write("pause\n")
+        bat.write("endlocal\n")
+
+
+def write_report(missing_files, output_report_file):
+    output_path = Path(output_report_file)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(
+        output_path,
+        "w",
+        newline="",
+        encoding="utf-8-sig"
+    ) as f:
+
+        writer = csv.writer(f)
+        writer.writerow([
+            "FileName",
+            "CRM_MSP_SourcePath",
+            "Status"
+        ])
+
+        for filename, source_path in missing_files:
+            writer.writerow([
+                filename,
+                source_path,
+                "Missing from Azure"
+            ])
+
+
+def main():
+    print("Reading Azure Blob listing...")
+    azure_files = read_azure_files(AZURE_LIST_FILE)
+
+    print("Reading CRM/MSP filepath listing...")
+    crm_files, crm_duplicates = parse_crm_filepaths(
+        CRM_FILEPATH_LIST
+    )
+
+    print("Comparing files...")
+    missing_files = compare_files(
+        azure_files,
+        crm_files
+    )
+
+    print("Generating BAT file...")
+    write_bat(
+        missing_files,
+        DESTINATION_FOLDER,
+        OUTPUT_BAT_FILE
+    )
+
+    print("Generating CSV report...")
+    write_report(
+        missing_files,
+        OUTPUT_REPORT_FILE
+    )
+
+    print()
+    print("============== SUMMARY ==============")
+    print(f"Unique files in Azure Blob : {len(azure_files):,}")
+    print(f"Unique files in CRM/MSP    : {len(crm_files):,}")
+    print(f"Missing from Azure Blob    : {len(missing_files):,}")
+    print(f"Duplicate CRM filenames    : {len(crm_duplicates):,}")
+    print("=====================================")
+    print()
+    print(f"BAT file created   : {OUTPUT_BAT_FILE}")
+    print(f"CSV report created : {OUTPUT_REPORT_FILE}")
+
+    if crm_duplicates:
+        print()
+        print("WARNING:")
+        print(
+            "Duplicate filenames were found in different CRM/MSP paths. "
+            "The BAT file uses the first path encountered for each filename."
+        )
+
+    if missing_files:
+        print()
+        print("First 20 files missing from Azure:")
+
+        for filename, source_path in missing_files[:20]:
+            print(f" - {filename}")
+
+    else:
+        print()
+        print(
+            "No missing files found. "
+            "Azure Blob and CRM/MSP filenames match."
+        )
+
+
+if __name__ == "__main__":
+    main()
